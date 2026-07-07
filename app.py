@@ -6,12 +6,19 @@ import json
 import os
 import pandas as pd
 import gspread
+import concurrent.futures
 from oauth2client.service_account import ServiceAccountCredentials
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
 st.set_page_config(page_title="SyncSketch PDF to Google Sheets", layout="wide")
+
+# ----------------------------------------------------------------------
+# Multithreading Settings
+# ----------------------------------------------------------------------
+# Increase this if you have a paid Gemini tier. Keep at 5-10 for free tier to avoid rate limits.
+MAX_WORKERS = 5 
 
 # ----------------------------------------------------------------------
 # Credentials Resolution
@@ -68,8 +75,11 @@ def process_pdf_rows(pdf_bytes):
             
     return row_images
 
-def extract_data_with_gemini(left_img, right_img, api_key):
-    """Uses Gemini 2.5 Flash to extract tabular data from cropped images."""
+def extract_single_row(pair, api_key):
+    """Helper to process a single row for the ThreadPoolExecutor."""
+    left_img = pair['left']
+    right_img = pair['right']
+    
     client = genai.Client(api_key=api_key)
     
     left_bio = io.BytesIO()
@@ -127,7 +137,7 @@ def extract_data_with_gemini(left_img, right_img, api_key):
         }
 
 def process_multiple_pdfs(uploaded_files, api_key):
-    """Processes a list of PDFs and returns a combined list of raw extracted dictionaries."""
+    """Processes a list of PDFs using multithreading for speed."""
     all_extracted_data = []
     
     for file in uploaded_files:
@@ -135,11 +145,23 @@ def process_multiple_pdfs(uploaded_files, api_key):
         pdf_bytes = file.read()
         rows = process_pdf_rows(pdf_bytes)
         
-        status_text = st.empty()
-        for index, pair in enumerate(rows):
-            status_text.text(f"Analyzing Row {index+1} of {len(rows)} via Gemini AI...")
-            parsed_vals = extract_data_with_gemini(pair['left'], pair['right'], api_key)
+        progress_bar = st.progress(0, text=f"Analyzing {len(rows)} rows with Gemini AI...")
+        
+        # Multithreaded Gemini Extraction
+        extracted_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Map retains the original order of the rows
+            futures = [executor.submit(extract_single_row, pair, api_key) for pair in rows]
             
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                # Update progress bar as tasks complete (order doesn't matter for the bar)
+                progress_bar.progress((i + 1) / len(rows))
+            
+            # Retrieve results in the exact original order
+            for future in futures:
+                extracted_results.append(future.result())
+        
+        for index, parsed_vals in enumerate(extracted_results):
             all_extracted_data.append({
                 "Source File": file.name,
                 "Scene/File Identification": parsed_vals.get("scene_id", "[UNCLEAR]"),
@@ -147,16 +169,21 @@ def process_multiple_pdfs(uploaded_files, api_key):
                 "Episode Timecode": parsed_vals.get("episode_timecode", "[UNCLEAR]"),
                 "Name": parsed_vals.get("reviewer_name", "[UNCLEAR]"),
                 "Note": parsed_vals.get("reviewer_note", "[UNCLEAR]"),
-                "left_img_obj": pair['left']
+                "left_img_obj": rows[index]['left']
             })
-        status_text.empty()
+            
+        progress_bar.empty()
         
     return all_extracted_data
 
 # ----------------------------------------------------------------------
-# Google Workspace Integration
+# Google Workspace Integration (Multithreaded)
 # ----------------------------------------------------------------------
-def upload_image_to_drive(drive_service, pil_img, filename, folder_id):
+def upload_single_image(drive_service, pil_img, filename, folder_id, row_index):
+    """Helper to upload a single image to Drive, returning the URL and index."""
+    if not isinstance(pil_img, Image.Image):
+        return row_index, str(pil_img) if pd.notnull(pil_img) else ""
+        
     bio = io.BytesIO()
     pil_img.save(bio, format="PNG")
     bio.seek(0)
@@ -176,7 +203,7 @@ def upload_image_to_drive(drive_service, pil_img, filename, folder_id):
         fileId=uploaded_file.get('id'), body={'type': 'anyone', 'role': 'reader'}
     ).execute()
     
-    return uploaded_file.get('webViewLink')
+    return row_index, uploaded_file.get('webViewLink')
 
 def create_google_sheet(target_creds, sheet_title, dataframe, folder_id):
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -193,41 +220,44 @@ def create_google_sheet(target_creds, sheet_title, dataframe, folder_id):
         ).execute()
         
     worksheet = sh.get_worksheet(0)
-    
     headers = ["Scene/File Identification", "Batch Timecode", "Episode Timecode", "Name", "Note", "Image Link", "Source File"]
     worksheet.append_row(headers)
     
-    progress_bar = st.progress(0, text="Uploading visuals & syncing cells to Google Sheets...")
+    data_dicts = dataframe.to_dict('records')
+    progress_bar = st.progress(0, text="Uploading visuals to Drive (Multithreaded)...")
+    
+    # Multithreaded Image Uploads
+    image_urls = [None] * len(data_dicts)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS * 2) as executor:
+        futures = []
+        for idx, row in enumerate(data_dicts):
+            filename = f"{sheet_title}_row_{idx+1}.png"
+            img_obj = row.get('left_img_obj') if 'left_img_obj' in row else row.get('Image Link')
+            futures.append(executor.submit(upload_single_image, drive_service, img_obj, filename, folder_id, idx))
+            
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            idx, url = future.result()
+            image_urls[idx] = url
+            progress_bar.progress((i + 1) / len(data_dicts))
+            
+    progress_bar.progress(1.0, text="Syncing cells to Google Sheets...")
     
     rows_to_write = []
-    data_dicts = dataframe.to_dict('records')
-    
     for idx, row in enumerate(data_dicts):
-        # Handle the image column gracefully depending on if it's a PIL object (new) or existing string (from Excel)
-        img_url = ""
-        if 'left_img_obj' in row and pd.notnull(row['left_img_obj']):
-            if isinstance(row['left_img_obj'], Image.Image):
-                filename = f"{sheet_title}_row_{idx+1}.png"
-                img_url = upload_image_to_drive(drive_service, row['left_img_obj'], filename, folder_id)
-            elif isinstance(row['left_img_obj'], str):
-                img_url = row['left_img_obj'] # It's already a URL from an Excel upload
-        elif 'Image Link' in row:
-             img_url = str(row['Image Link']) if pd.notnull(row['Image Link']) else ""
-
         rows_to_write.append([
             str(row.get('Scene/File Identification', '')),
             str(row.get('Batch Timecode', '')),
             str(row.get('Episode Timecode', '')),
             str(row.get('Name', '')),
             str(row.get('Note', '')),
-            img_url,
+            image_urls[idx],
             str(row.get('Source File', ''))
         ])
-        progress_bar.progress((idx + 1) / len(data_dicts))
         
     worksheet.append_rows(rows_to_write)
     worksheet.format("A1:G1", {"textFormat": {"bold": True}})
     
+    progress_bar.empty()
     return sh.url
 
 # ----------------------------------------------------------------------
@@ -253,7 +283,7 @@ if workflow_mode == "1. Single or Batch PDFs (Process separately & stack)":
         if not gemini_key:
             st.error("🔑 Gemini API Key missing.")
         else:
-            with st.spinner("Extracting..."):
+            with st.spinner("Extracting (Multithreaded)..."):
                 raw_data = process_multiple_pdfs(uploaded_pdfs, gemini_key)
                 st.session_state.final_df = pd.DataFrame(raw_data)
                 st.success("Extraction Complete!")
@@ -270,11 +300,9 @@ elif workflow_mode == "2. Combine Notes (Merge multiple PDFs by Timecode)":
                 raw_data = process_multiple_pdfs(uploaded_pdfs, gemini_key)
                 df = pd.DataFrame(raw_data)
                 
-                # Custom Aggregation to group by timecode
                 def merge_notes(series):
                     return "\n\n".join([str(x) for x in series])
                 
-                # Group by Scene and Episode Timecode
                 merged_df = df.groupby(['Scene/File Identification', 'Episode Timecode']).agg({
                     'Batch Timecode': 'first',
                     'Name': lambda x: ' & '.join(x.unique()),
@@ -298,14 +326,9 @@ elif workflow_mode == "3. Update Existing Excel (Append new PDF to Excel Sheet)"
             st.error("🔑 Gemini API Key missing.")
         else:
             with st.spinner("Reading Excel and parsing new PDF..."):
-                # Read Excel
                 df_excel = pd.read_excel(uploaded_excel)
-                
-                # Process PDF
                 raw_pdf_data = process_multiple_pdfs([uploaded_pdf_for_excel], gemini_key)
                 df_pdf = pd.DataFrame(raw_pdf_data)
-                
-                # Combine
                 combined_df = pd.concat([df_excel, df_pdf], ignore_index=True)
                 st.session_state.final_df = combined_df
                 st.success("Append Complete!")
@@ -317,7 +340,6 @@ if 'final_df' in st.session_state and not st.session_state.final_df.empty:
     st.write("---")
     st.subheader("📋 Step 2: Preview Final Dataset")
     
-    # Display safe version without PIL image objects breaking Streamlit rendering
     display_df = st.session_state.final_df.drop(columns=['left_img_obj'], errors='ignore')
     st.dataframe(display_df, use_container_width=True)
     
