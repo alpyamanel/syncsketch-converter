@@ -7,13 +7,15 @@ import concurrent.futures
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+import json
 
 st.set_page_config(page_title="SyncSketch PDF to Excel", layout="wide")
 
+# Process 5 pages at a time simultaneously (Incredibly fast)
 MAX_WORKERS = 5 
 
 # ----------------------------------------------------------------------
-# Credentials Resolution
+# Configuration
 # ----------------------------------------------------------------------
 gemini_key = None
 if "GEMINI_API_KEY" in st.secrets:
@@ -24,53 +26,91 @@ else:
     gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
 
 # ----------------------------------------------------------------------
-# Core Logic: PDF Processing & Vision AI
+# Core Logic: Extract Pure Images & Render Pages
 # ----------------------------------------------------------------------
-def process_pdf_rows(pdf_bytes):
+def process_pdf_pages(pdf_bytes):
+    """
+    Instead of blindly cutting the page into thirds, this extracts the 
+    pure, original embedded screenshot files directly from the PDF.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    row_images = []
+    pages_data = []
     
     for page_num in range(len(doc)):
         page = doc[page_num]
-        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
-        page_img = Image.open(io.BytesIO(pix.tobytes("png")))
         
-        width, height = page_img.size
-        row_height = height // 3 
+        # 1. Extract pure embedded screenshot files
+        screenshots_info = []
+        for img_info in page.get_image_info(xrefs=True):
+            xref = img_info.get("xref")
+            if xref:
+                try:
+                    base_image = doc.extract_image(xref)
+                    pil_img = Image.open(io.BytesIO(base_image["image"]))
+                    # Filter out tiny icons/avatars; only keep the large video frames
+                    if pil_img.width > 200 and pil_img.height > 100:
+                        screenshots_info.append({
+                            "y0": img_info["bbox"][1], 
+                            "img": pil_img
+                        })
+                except Exception:
+                    pass
+                    
+        # Sort top-to-bottom so they perfectly match the text read by Gemini
+        screenshots_info.sort(key=lambda x: x["y0"])
+        extracted_images = [s["img"] for s in screenshots_info]
         
-        for i in range(3):
-            top = i * row_height
-            bottom = (i + 1) * row_height
-            if top >= height:
-                break
+        # 2. Render the full page for Gemini to read the text
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        full_page_img = Image.open(io.BytesIO(pix.tobytes("png")))
+        
+        # Safe Fallback just in case the PDF is flattened
+        if not extracted_images:
+            height = full_page_img.height
+            row_height = height // 3
+            for i in range(3):
+                top = i * row_height
+                bottom = (i + 1) * row_height
+                row_img = full_page_img.crop((0, top, int(full_page_img.width * 0.55), bottom))
+                extracted_images.append(row_img)
                 
-            row_img = page_img.crop((0, top, width, bottom))
-            split_x = int(width * 0.55)
-            left_img = row_img.crop((0, 0, split_x, row_img.height))
-            right_img = row_img.crop((split_x, 0, width, row_img.height))
-            
-            row_images.append({"left": left_img, "right": right_img})
-            
-    return row_images
+        pages_data.append({
+            "page_img": full_page_img,
+            "screenshots": extracted_images
+        })
+        
+    return pages_data
 
-def extract_single_row(pair, api_key):
-    left_img = pair['left']
-    right_img = pair['right']
+# ----------------------------------------------------------------------
+# Gemini Vision AI
+# ----------------------------------------------------------------------
+def extract_page_data(page_data, api_key):
+    """Sends a single full page to Gemini to extract all rows at once."""
+    page_img = page_data["page_img"]
+    screenshots = page_data["screenshots"]
     
     client = genai.Client(api_key=api_key)
-    left_bio = io.BytesIO()
-    left_img.save(left_bio, format="PNG")
-    right_bio = io.BytesIO()
-    right_img.save(right_bio, format="PNG")
+    bio = io.BytesIO()
+    page_img.save(bio, format="PNG")
     
-    prompt = """
-    Analyze these two segments of a review row from a SyncSketch PDF.
-    1. Extract 'Scene/File Identification' from top-right INSIDE the left image.
-    2. Extract 'Batch Timecode' from bottom-centre near 'REC TC' in the left image.
-    3. Extract 'Episode Timecode' from bottom-right in the left image.
-    4. Extract reviewer's 'Name' (bold/black text before colon) from right image.
-    5. Extract 'Note' (text after colon) from right image.
-    Ignore green text. Mark missing/unclear strictly as [UNCLEAR].
+    prompt = f"""
+    Analyze this page from a SyncSketch review PDF.
+    There are exactly {len(screenshots)} review rows on this page.
+    Extract the data for EACH row in top-to-bottom order, returning a list of exactly {len(screenshots)} objects.
+
+    For each row, look at the screenshot on the left and the text on the right:
+    1. 'Scene/File Identification': Found top-right INSIDE the left screenshot.
+    2. 'Batch Timecode': Found bottom-centre near 'REC TC' INSIDE the left screenshot.
+    3. 'Episode Timecode': Found bottom-right INSIDE the left screenshot.
+    4. 'Name': The bold/black text before the colon (:) in the right text area.
+    5. 'Note': The text after the colon (:) in the right text area.
+
+    CRITICAL NAME NORMALIZATION & FIXES:
+    SyncSketch OCR often cuts off or misspells reviewer names. YOU MUST FIX THESE:
+    - If you see variations like 'Trevor Wa', 'Trever', 'Trever Wall', or 'Trevor W', output strictly 'Trevor Wall'.
+    - If you see variations like 'James Ar', 'Jame', or 'James A', output strictly 'James Anderson'.
+    - Apply logical correction to fix any obvious truncations (e.g., 'William F' to 'William Fung').
+    - Ignore green text (like FRAME, TIMECODE). Mark missing/unclear strictly as [UNCLEAR].
     """
     
     class SyncSketchRow(BaseModel):
@@ -80,60 +120,94 @@ def extract_single_row(pair, api_key):
         reviewer_name: str
         reviewer_note: str
 
+    class PageExtraction(BaseModel):
+        rows: list[SyncSketchRow]
+
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
-                types.Part.from_bytes(data=left_bio.getvalue(), mime_type="image/png"),
-                types.Part.from_bytes(data=right_bio.getvalue(), mime_type="image/png"),
+                types.Part.from_bytes(data=bio.getvalue(), mime_type="image/png"),
                 prompt
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=SyncSketchRow,
+                response_schema=PageExtraction,
                 temperature=0.0
             ),
         )
-        import json
-        return json.loads(response.text)
+        
+        data = json.loads(response.text)
+        parsed_rows = data.get("rows", [])
+        
+        results = []
+        max_len = max(len(parsed_rows), len(screenshots))
+        
+        for i in range(max_len):
+            # Gracefully align the AI text data with the extracted images
+            if i < len(parsed_rows):
+                r = parsed_rows[i]
+                sc_id = r.get("scene_id", "[UNCLEAR]")
+                btc = r.get("batch_timecode", "[UNCLEAR]")
+                etc = r.get("episode_timecode", "[UNCLEAR]")
+                name = r.get("reviewer_name", "[UNCLEAR]")
+                note = r.get("reviewer_note", "[UNCLEAR]")
+            else:
+                sc_id = btc = etc = name = note = "[UNCLEAR]"
+                
+            img = screenshots[i] if i < len(screenshots) else None
+            
+            results.append({
+                "Scene/File Identification": sc_id,
+                "Batch Timecode": btc,
+                "Episode Timecode": etc,
+                "Name": name,
+                "Note": note,
+                "left_img_obj": img
+            })
+        return results
+        
     except Exception as e:
-        return {"scene_id": "[UNCLEAR]", "batch_timecode": "[UNCLEAR]", "episode_timecode": "[UNCLEAR]", "reviewer_name": "[UNCLEAR]", "reviewer_note": f"[ERROR: {str(e)}]"}
+        return [{
+            "Scene/File Identification": "[UNCLEAR]",
+            "Batch Timecode": "[UNCLEAR]",
+            "Episode Timecode": "[UNCLEAR]",
+            "Name": "[UNCLEAR]",
+            "Note": f"[ERROR: {str(e)}]",
+            "left_img_obj": screenshots[0] if screenshots else None
+        }]
 
 def process_multiple_pdfs(uploaded_files, api_key):
     all_extracted_data = []
     
     for file in uploaded_files:
         pdf_bytes = file.read()
-        rows = process_pdf_rows(pdf_bytes)
+        pages_data = process_pdf_pages(pdf_bytes)
+        
         progress_bar = st.progress(0, text=f"Analyzing {file.name} with AI...")
         
-        extracted_results = [None] * len(rows)
+        page_results = [None] * len(pages_data)
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(extract_single_row, pair, api_key): i for i, pair in enumerate(rows)}
+            futures = {executor.submit(extract_page_data, p_data, api_key): i for i, p_data in enumerate(pages_data)}
             for count, future in enumerate(concurrent.futures.as_completed(futures)):
                 idx = futures[future]
-                extracted_results[idx] = future.result()
-                progress_bar.progress((count + 1) / len(rows))
+                page_results[idx] = future.result()
+                progress_bar.progress((count + 1) / len(pages_data))
         
-        for index, parsed_vals in enumerate(extracted_results):
-            all_extracted_data.append({
-                "Source File": file.name,
-                "Scene/File Identification": parsed_vals.get("scene_id", ""),
-                "Batch Timecode": parsed_vals.get("batch_timecode", ""),
-                "Episode Timecode": parsed_vals.get("episode_timecode", ""),
-                "Name": parsed_vals.get("reviewer_name", ""),
-                "Note": parsed_vals.get("reviewer_note", ""),
-                "left_img_obj": rows[index]['left']
-            })
+        for pr in page_results:
+            for row in pr:
+                row["Source File"] = file.name
+                all_extracted_data.append(row)
+                
         progress_bar.empty()
         
     return all_extracted_data
 
 # ----------------------------------------------------------------------
-# Excel Generation with Advanced Formatting
+# Perfect Excel Generation
 # ----------------------------------------------------------------------
 def generate_excel_with_images(df):
-    """Creates a beautifully formatted Excel file in memory with embedded images."""
+    """Creates a beautifully formatted Excel file with perfect image boundaries."""
     output = io.BytesIO()
     
     text_df = df.drop(columns=['left_img_obj'], errors='ignore')
@@ -145,6 +219,7 @@ def generate_excel_with_images(df):
     workbook = writer.book
     worksheet = writer.sheets['SyncSketch Notes']
     
+    # Beautiful formatting profiles
     header_format = workbook.add_format({
         'bold': True,
         'valign': 'vcenter',
@@ -162,6 +237,7 @@ def generate_excel_with_images(df):
     for col_num, value in enumerate(text_df.columns.values):
         worksheet.write(0, col_num, value, header_format)
         
+    # Set explicit column widths
     worksheet.set_column('A:A', 30, cell_format) 
     worksheet.set_column('B:C', 20, cell_format) 
     worksheet.set_column('D:D', 20, cell_format) 
@@ -170,23 +246,29 @@ def generate_excel_with_images(df):
     worksheet.set_column('G:G', 25, cell_format) 
     
     for idx, row in df.iterrows():
+        # Lock Excel row height to ~146 pixels (110 points)
         worksheet.set_row(idx + 1, 110) 
         
         img = row.get('left_img_obj')
         if isinstance(img, Image.Image):
-            img_io = io.BytesIO()
-            img.save(img_io, format='PNG')
+            # Calculate exactly to 135 pixels high so it leaves a 5px clean margin inside the cell
+            target_height = 135
+            aspect_ratio = img.width / img.height
+            target_width = int(target_height * aspect_ratio)
             
+            img_resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            img_io = io.BytesIO()
+            img_resized.save(img_io, format='PNG')
+            
+            # Insert the image perfectly centered with zero overlap
             worksheet.insert_image(
                 idx + 1, 5, 
                 f'img_{idx}.png', 
                 {
                     'image_data': img_io, 
-                    'x_scale': 0.22, 
-                    'y_scale': 0.22, 
                     'x_offset': 5, 
                     'y_offset': 5,
-                    'object_position': 2 
+                    'object_position': 1 
                 }
             )
             
@@ -215,13 +297,13 @@ if st.button("Process PDFs") and uploaded_pdfs:
     if not gemini_key:
         st.error("🔑 Gemini API Key missing.")
     else:
-        # Generate a smart default file name based on uploads
+        # Dynamic naming logic
         if len(uploaded_pdfs) == 1:
             st.session_state.default_filename = uploaded_pdfs[0].name.replace(".pdf", "").replace(".PDF", "")
         else:
             st.session_state.default_filename = "Combined_SyncSketch_Notes"
             
-        with st.spinner("Extracting (Multithreaded)..."):
+        with st.spinner("Processing Pages & Extracting Screenshots..."):
             raw_data = process_multiple_pdfs(uploaded_pdfs, gemini_key)
             df = pd.DataFrame(raw_data)
             
@@ -251,17 +333,14 @@ if 'final_df' in st.session_state and not st.session_state.final_df.empty:
     
     st.subheader("🚀 Step 3: Download Formatted Excel")
     
-    # Custom File Naming UI
     custom_filename = st.text_input("Name your output file (optional):", value=st.session_state.get('default_filename', 'SyncSketch_Export'))
     
-    # Ensure it ends with .xlsx safely, even if they erase the text box completely
     clean_name = custom_filename.strip() if custom_filename.strip() else st.session_state.get('default_filename', 'SyncSketch_Export')
     if not clean_name.lower().endswith('.xlsx'):
         clean_name += '.xlsx'
         
     st.write("Click below to download your Master Excel file. The formatting, borders, and image boundaries have all been automatically optimized.")
     
-    # Generate the formatted Excel file in memory
     excel_data = generate_excel_with_images(st.session_state.final_df)
     
     st.download_button(
