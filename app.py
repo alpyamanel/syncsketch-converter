@@ -136,47 +136,40 @@ def generate_excel_with_images(df):
     """Creates a beautifully formatted Excel file in memory with embedded images."""
     output = io.BytesIO()
     
-    # Isolate the text data and prep an empty column for our images
     text_df = df.drop(columns=['left_img_obj'], errors='ignore')
     text_df.insert(5, 'Visual Capture', '') 
     
-    # Initialize the Excel Writer using the xlsxwriter engine
     writer = pd.ExcelWriter(output, engine='xlsxwriter')
     text_df.to_excel(writer, sheet_name='SyncSketch Notes', index=False)
     
     workbook = writer.book
     worksheet = writer.sheets['SyncSketch Notes']
     
-    # Create beautiful formatting profiles
     header_format = workbook.add_format({
         'bold': True,
         'valign': 'vcenter',
         'align': 'center',
-        'bg_color': '#D3D3D3', # Light Gray Background
+        'bg_color': '#D3D3D3',
         'border': 1
     })
     
     cell_format = workbook.add_format({
-        'text_wrap': True,    # CRITICAL: Forces text to stay inside the cell
-        'valign': 'vcenter',  # Centers text vertically next to the image
-        'border': 1           # Adds clean grid lines
+        'text_wrap': True,
+        'valign': 'vcenter',
+        'border': 1
     })
     
-    # Overwrite headers with our custom header format
     for col_num, value in enumerate(text_df.columns.values):
         worksheet.write(0, col_num, value, header_format)
         
-    # Apply column widths and the text wrapping format
-    worksheet.set_column('A:A', 30, cell_format) # Scene ID
-    worksheet.set_column('B:C', 20, cell_format) # Timecodes
-    worksheet.set_column('D:D', 20, cell_format) # Name
-    worksheet.set_column('E:E', 50, cell_format) # Note (Extra wide for lots of text)
-    worksheet.set_column('F:F', 35, cell_format) # Visual Capture (Image column)
-    worksheet.set_column('G:G', 25, cell_format) # Source File
+    worksheet.set_column('A:A', 30, cell_format) 
+    worksheet.set_column('B:C', 20, cell_format) 
+    worksheet.set_column('D:D', 20, cell_format) 
+    worksheet.set_column('E:E', 50, cell_format) 
+    worksheet.set_column('F:F', 35, cell_format) 
+    worksheet.set_column('G:G', 25, cell_format) 
     
-    # Embed the images and set explicit row heights
     for idx, row in df.iterrows():
-        # Set row height to 110 pixels to comfortably fit the image
         worksheet.set_row(idx + 1, 110) 
         
         img = row.get('left_img_obj')
@@ -184,9 +177,6 @@ def generate_excel_with_images(df):
             img_io = io.BytesIO()
             img.save(img_io, format='PNG')
             
-            # Insert the image into Column F (Index 5).
-            # x_offset and y_offset give it a 5px margin so it doesn't touch the borders.
-            # object_position: 2 ensures the image moves with the cells but maintains aspect ratio.
             worksheet.insert_image(
                 idx + 1, 5, 
                 f'img_{idx}.png', 
@@ -225,12 +215,17 @@ if st.button("Process PDFs") and uploaded_pdfs:
     if not gemini_key:
         st.error("🔑 Gemini API Key missing.")
     else:
+        # Generate a smart default file name based on uploads
+        if len(uploaded_pdfs) == 1:
+            st.session_state.default_filename = uploaded_pdfs[0].name.replace(".pdf", "").replace(".PDF", "")
+        else:
+            st.session_state.default_filename = "Combined_SyncSketch_Notes"
+            
         with st.spinner("Extracting (Multithreaded)..."):
             raw_data = process_multiple_pdfs(uploaded_pdfs, gemini_key)
             df = pd.DataFrame(raw_data)
             
             if workflow_mode == "2. Combine Notes (Merge multiple PDFs by Timecode)":
-                # Combine matching timecodes and merge the notes text
                 merged_df = df.groupby(['Scene/File Identification', 'Episode Timecode']).agg({
                     'Batch Timecode': 'first',
                     'Name': lambda x: ' & '.join(x.unique()),
@@ -251,19 +246,27 @@ if 'final_df' in st.session_state and not st.session_state.final_df.empty:
     st.write("---")
     st.subheader("📋 Step 2: Preview Final Dataset")
     
-    # Hide the raw PIL image object from the browser preview
     display_df = st.session_state.final_df.drop(columns=['left_img_obj'], errors='ignore')
     st.dataframe(display_df, use_container_width=True)
     
     st.subheader("🚀 Step 3: Download Formatted Excel")
+    
+    # Custom File Naming UI
+    custom_filename = st.text_input("Name your output file (optional):", value=st.session_state.get('default_filename', 'SyncSketch_Export'))
+    
+    # Ensure it ends with .xlsx safely, even if they erase the text box completely
+    clean_name = custom_filename.strip() if custom_filename.strip() else st.session_state.get('default_filename', 'SyncSketch_Export')
+    if not clean_name.lower().endswith('.xlsx'):
+        clean_name += '.xlsx'
+        
     st.write("Click below to download your Master Excel file. The formatting, borders, and image boundaries have all been automatically optimized.")
     
     # Generate the formatted Excel file in memory
     excel_data = generate_excel_with_images(st.session_state.final_df)
     
     st.download_button(
-        label="📥 Download Master Excel File",
+        label=f"📥 Download {clean_name}",
         data=excel_data,
-        file_name="SyncSketch_Export.xlsx",
+        file_name=clean_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
