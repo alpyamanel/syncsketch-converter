@@ -11,8 +11,8 @@ import json
 
 st.set_page_config(page_title="SyncSketch PDF to Excel", layout="wide")
 
-# Process 5 pages at a time simultaneously (Incredibly fast)
-MAX_WORKERS = 5 
+# Increased concurrency for faster processing
+MAX_WORKERS = 10 
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -29,10 +29,6 @@ else:
 # Core Logic: Extract Pure Images & Render Pages
 # ----------------------------------------------------------------------
 def process_pdf_pages(pdf_bytes):
-    """
-    Instead of blindly cutting the page into thirds, this extracts the 
-    pure, original embedded screenshot files directly from the PDF.
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_data = []
     
@@ -47,7 +43,6 @@ def process_pdf_pages(pdf_bytes):
                 try:
                     base_image = doc.extract_image(xref)
                     pil_img = Image.open(io.BytesIO(base_image["image"]))
-                    # Filter out tiny icons/avatars; only keep the large video frames
                     if pil_img.width > 200 and pil_img.height > 100:
                         screenshots_info.append({
                             "y0": img_info["bbox"][1], 
@@ -56,15 +51,14 @@ def process_pdf_pages(pdf_bytes):
                 except Exception:
                     pass
                     
-        # Sort top-to-bottom so they perfectly match the text read by Gemini
         screenshots_info.sort(key=lambda x: x["y0"])
         extracted_images = [s["img"] for s in screenshots_info]
         
-        # 2. Render the full page for Gemini to read the text
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        # 2. Render the full page for Gemini at a lower, network-friendly resolution
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         full_page_img = Image.open(io.BytesIO(pix.tobytes("png")))
         
-        # Safe Fallback just in case the PDF is flattened
+        # Safe Fallback
         if not extracted_images:
             height = full_page_img.height
             row_height = height // 3
@@ -85,13 +79,14 @@ def process_pdf_pages(pdf_bytes):
 # Gemini Vision AI
 # ----------------------------------------------------------------------
 def extract_page_data(page_data, api_key):
-    """Sends a single full page to Gemini to extract all rows at once."""
     page_img = page_data["page_img"]
     screenshots = page_data["screenshots"]
     
     client = genai.Client(api_key=api_key)
     bio = io.BytesIO()
-    page_img.save(bio, format="PNG")
+    
+    # Compress the PNG payload for faster API upload
+    page_img.save(bio, format="PNG", optimize=True)
     
     prompt = f"""
     Analyze this page from a SyncSketch review PDF.
@@ -144,7 +139,6 @@ def extract_page_data(page_data, api_key):
         max_len = max(len(parsed_rows), len(screenshots))
         
         for i in range(max_len):
-            # Gracefully align the AI text data with the extracted images
             if i < len(parsed_rows):
                 r = parsed_rows[i]
                 sc_id = r.get("scene_id", "[UNCLEAR]")
@@ -207,7 +201,6 @@ def process_multiple_pdfs(uploaded_files, api_key):
 # Perfect Excel Generation
 # ----------------------------------------------------------------------
 def generate_excel_with_images(df):
-    """Creates a beautifully formatted Excel file with perfect image boundaries."""
     output = io.BytesIO()
     
     text_df = df.drop(columns=['left_img_obj'], errors='ignore')
@@ -219,7 +212,6 @@ def generate_excel_with_images(df):
     workbook = writer.book
     worksheet = writer.sheets['SyncSketch Notes']
     
-    # Beautiful formatting profiles
     header_format = workbook.add_format({
         'bold': True,
         'valign': 'vcenter',
@@ -237,7 +229,6 @@ def generate_excel_with_images(df):
     for col_num, value in enumerate(text_df.columns.values):
         worksheet.write(0, col_num, value, header_format)
         
-    # Set explicit column widths
     worksheet.set_column('A:A', 30, cell_format) 
     worksheet.set_column('B:C', 20, cell_format) 
     worksheet.set_column('D:D', 20, cell_format) 
@@ -246,21 +237,19 @@ def generate_excel_with_images(df):
     worksheet.set_column('G:G', 25, cell_format) 
     
     for idx, row in df.iterrows():
-        # Lock Excel row height to ~146 pixels (110 points)
         worksheet.set_row(idx + 1, 110) 
         
         img = row.get('left_img_obj')
         if isinstance(img, Image.Image):
-            # Calculate exactly to 135 pixels high so it leaves a 5px clean margin inside the cell
             target_height = 135
             aspect_ratio = img.width / img.height
             target_width = int(target_height * aspect_ratio)
             
-            img_resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            # Using BILINEAR is slightly faster than LANCZOS and looks identical here
+            img_resized = img.resize((target_width, target_height), Image.Resampling.BILINEAR)
             img_io = io.BytesIO()
             img_resized.save(img_io, format='PNG')
             
-            # Insert the image perfectly centered with zero overlap
             worksheet.insert_image(
                 idx + 1, 5, 
                 f'img_{idx}.png', 
@@ -297,7 +286,6 @@ if st.button("Process PDFs") and uploaded_pdfs:
     if not gemini_key:
         st.error("🔑 Gemini API Key missing.")
     else:
-        # Dynamic naming logic
         if len(uploaded_pdfs) == 1:
             st.session_state.default_filename = uploaded_pdfs[0].name.replace(".pdf", "").replace(".PDF", "")
         else:
