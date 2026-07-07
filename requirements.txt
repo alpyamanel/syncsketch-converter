@@ -5,3 +5,5 @@ google-genai
 gspread
 oauth2client
 google-api-python-client
+pandas
+openpyxl
